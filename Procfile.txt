@@ -1,1 +1,1 @@
-worker: python BotBybit.py
+worker: python V3_BTC.py

@@ -121,7 +121,7 @@ KELLY_FRACTIONS = {
 
 # Operational
 VN_TZ = timezone(timedelta(hours=7))
-FETCH_LIMIT = 800 
+FETCH_LIMIT = 1200 
 
 # API Clients
 binance_client = ccxt.binance({'options': {'defaultType': 'future'}})

@@ -83,7 +83,7 @@ X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET", "")
 # FEATURE TOGGLES (Bật/Tắt Chức Năng)
 # ==============================================================================
 
-ENABLE_BYBIT_TRADING = False   # Bật/Tắt giao dịch tự động trên Bybit
+ENABLE_BYBIT_TRADING = True   # Bật/Tắt giao dịch tự động trên Bybit
 ENABLE_TELEGRAM = True         # Bật/Tắt thông báo Telegram
 ENABLE_X = False               # Bật/Tắt thông báo X (Twitter)
 

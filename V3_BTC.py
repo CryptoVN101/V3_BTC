@@ -83,7 +83,7 @@ X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET", "")
 # FEATURE TOGGLES (Bật/Tắt Chức Năng)
 # ==============================================================================
 
-ENABLE_BYBIT_TRADING = True   # Bật/Tắt giao dịch tự động trên Bybit
+ENABLE_BYBIT_TRADING = False   # Bật/Tắt giao dịch tự động trên Bybit
 ENABLE_TELEGRAM = True         # Bật/Tắt thông báo Telegram
 ENABLE_X = False               # Bật/Tắt thông báo X (Twitter)
 
@@ -121,7 +121,7 @@ KELLY_FRACTIONS = {
 
 # Operational
 VN_TZ = timezone(timedelta(hours=7))
-FETCH_LIMIT = 1200 
+FETCH_LIMIT = 1200 # Cần tối thiểu 800 nến M15 (200 nến H1) cho EMA200
 
 # API Clients
 binance_client = ccxt.binance({'options': {'defaultType': 'future'}})
@@ -387,7 +387,10 @@ async def run_scan(bot, exchange):
         df_m15.set_index('time', inplace=True)
         
         df = process_data(df_m15)
-        if df.empty: return
+        if df is None or df.empty or len(df) < 2: 
+            # Bỏ qua nếu dữ liệu sau khi dropna bị rỗng do chưa đủ số nến
+            logger.warning(f"⚠️ Dữ liệu chưa đủ độ dài để tính EMA200 (Len: {len(df) if df is not None else 0}).")
+            return
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
@@ -525,7 +528,9 @@ async def run_scan(bot, exchange):
                         "qty": size, "sl": float(p.get('stopLoss', 0) or 0), "tp": float(p.get('takeProfit', 0) or 0)
                     })
             
-            b_dir, b_score, b_state = direction, score, market_state
+            # b_dir bắt đầu là None, chỉ gán sau khi vượt qua PENDING/BLOCK filter
+            b_dir = None
+            b_score, b_state = score, market_state
             
             # PENDING Bybit Filter
             if state_tracker.bybit_pending:
@@ -534,31 +539,29 @@ async def run_scan(bot, exchange):
                 
                 if current_time >= p_end_time:
                     min_sc = MIN_SCORE_SHORT if p_dir == "SHORT" else MIN_SCORE_LONG
-                    if b_score >= min_sc and "BLOCK" not in (b_dir or "") and b_dir == p_dir:
+                    if b_score >= min_sc and "BLOCK" not in (direction or "") and direction == p_dir:
                         b_dir = p_dir
-                    else:
-                        b_dir = None
                     state_tracker.bybit_pending = None
-                elif current_time < p_end_time:
-                    b_dir = None
+                # elif current_time < p_end_time: b_dir stays None (still pending)
             
-            elif b_dir and "PENDING_" in b_dir:
+            elif direction and "PENDING_" in direction:
                 state_tracker.bybit_pending = {
-                    'dir': b_dir.split("_")[1],
+                    'dir': direction.split("_")[1],
                     'target_time': pending_time
                 }
-                b_dir = None
+                # b_dir stays None
                 
-            elif b_dir and "BLOCK" in b_dir:
-                b_dir = None
+            elif direction and "BLOCK" not in direction:
+                # Chỉ chấp nhận tín hiệu hợp lệ (không phải PENDING/BLOCK)
+                b_dir = direction
 
-            # ENTRY LOGIC
+            # ENTRY LOGIC — Chỉ thực hiện khi b_dir hợp lệ
             if b_dir:
                 min_s = MIN_SCORE_SHORT if b_dir == "SHORT" else MIN_SCORE_LONG
                 if b_score >= min_s:
-                    atr_h1 = prev.get('atr_h1', 0) if not pd.isna(prev.get('atr_h1')) else 0
-                    sl_dist = max(atr_h1 * SL_ATR_MULTIPLIER, current_price * MIN_SL)
-                    tp_dist = max(sl_dist * MIN_RR_RATIO, atr_h1 * TP_ATR_MULTIPLIER)
+                    atr_h1_val = prev.get('atr_h1', 0) if not pd.isna(prev.get('atr_h1')) else 0
+                    sl_dist = max(atr_h1_val * SL_ATR_MULTIPLIER, current_price * MIN_SL)
+                    tp_dist = max(sl_dist * MIN_RR_RATIO, atr_h1_val * TP_ATR_MULTIPLIER)
                     
                     sl = current_price - sl_dist if b_dir == "LONG" else current_price + sl_dist
                     tp = current_price + tp_dist if b_dir == "LONG" else current_price - tp_dist
@@ -569,13 +572,14 @@ async def run_scan(bot, exchange):
                     if USE_KELLY:
                         kelly_risk_pct = KELLY_FRACTIONS.get(b_state, 0.02)
                         risk_amount = equity * kelly_risk_pct
-                        multiplier = 1.0 # Handled by fraction
+                        b_multiplier = 1.0
                     else:
-                        risk_amount = equity * RISK_PER_TRADE * multiplier
+                        b_multiplier = multiplier
+                        risk_amount = equity * RISK_PER_TRADE * b_multiplier
                         
                     sl_pct = sl_dist / current_price
-                    notional = risk_amount / sl_pct
-                    target_qty = notional / current_price
+                    notional = risk_amount / sl_pct if sl_pct > 0 else 0
+                    target_qty = notional / current_price if current_price > 0 else 0
                     
                     max_qty = (equity * 0.95 / current_price) * LEVERAGE
                     target_qty = min(target_qty, max_qty)
@@ -583,45 +587,37 @@ async def run_scan(bot, exchange):
                     existing_same_dir = [p for p in state_tracker.bybit_positions if p["dir"] == b_dir]
                     existing_opposite_dir = [p for p in state_tracker.bybit_positions if p["dir"] != b_dir]
                     
-                    # Case A: Ngược chiều
+                    # Case A: Ngược chiều — YÊU CẦU MIN_SCORE_REV + CHƯA CÓ HEDGE
+                    # (Chỉ mở Hedge khi điểm đủ mạnh để đảo chiều VÀ chưa có lệnh ngược chiều nào)
                     if existing_opposite_dir:
-                        logger.info(f"⚠️ Bybit: Có {len(existing_opposite_dir)} lệnh ngược chiều, mở lệnh mới {b_dir} Hedge")
-                        if len(state_tracker.bybit_positions) < MAX_BYBIT_POSITIONS:
+                        if len(existing_opposite_dir) == 0 or b_score < MIN_SCORE_REV:
+                            logger.info(f"⚠️ Bybit: Tín hiệu {b_dir} ngược chiều nhưng score={b_score} < REV={MIN_SCORE_REV} hoặc đã có hedge → Bỏ qua")
+                        elif len(state_tracker.bybit_positions) < MAX_BYBIT_POSITIONS:
+                            logger.info(f"⚠️ Bybit: Mở Hedge {b_dir} (score={b_score} >= REV={MIN_SCORE_REV})")
                             side_str = 'buy' if b_dir == 'LONG' else 'sell'
                             pos_idx = 1 if b_dir == 'LONG' else 2
-                            
                             await asyncio.to_thread(exchange.create_market_order, BYBIT_SYMBOL, side_str, target_qty, params={
                                 'positionIdx': pos_idx,
-                                'stopLoss': {'triggerPrice': str(sl), 'type': 'market'},
-                                'takeProfit': {'triggerPrice': str(tp), 'type': 'market'}
+                                'stopLoss': {'triggerPrice': str(round(sl, 2)), 'type': 'market'},
+                                'takeProfit': {'triggerPrice': str(round(tp, 2)), 'type': 'market'}
                             })
-                            logger.info(f"✅ Bybit Entry (Ngược chiều): {b_dir} @ {current_price:.2f} | Qty: {target_qty:.4f}")
+                            logger.info(f"✅ Bybit Entry (Hedge {b_dir}): @ {current_price:.2f} | Qty: {target_qty:.4f}")
+                        else:
+                            logger.info(f"⚠️ Bybit: Đã đầy {MAX_BYBIT_POSITIONS} vị thế, không mở thêm")
                     
-                    # Case B: Cùng chiều
+                    # Case B: Cùng chiều — Không add-on, chỉ log
                     elif existing_same_dir:
-                        total_existing_qty = sum([p["qty"] for p in existing_same_dir])
-                        additional_qty = target_qty - total_existing_qty
-                        
-                        if additional_qty > 0.0001:
-                            if len(state_tracker.bybit_positions) < MAX_BYBIT_POSITIONS:
-                                side_str = 'buy' if b_dir == 'LONG' else 'sell'
-                                pos_idx = 1 if b_dir == 'LONG' else 2
-                                await asyncio.to_thread(exchange.create_market_order, BYBIT_SYMBOL, side_str, additional_qty, params={
-                                    'positionIdx': pos_idx,
-                                    'stopLoss': {'triggerPrice': str(sl), 'type': 'market'},
-                                    'takeProfit': {'triggerPrice': str(tp), 'type': 'market'}
-                                })
-                                logger.info(f"✅ Bybit Add Position (Cùng chiều): {b_dir} | Add Qty: {additional_qty:.4f}")
+                        logger.info(f"ℹ️ Bybit: Đã có lệnh {b_dir} cùng chiều, bỏ qua tín hiệu trùng lặp")
                     
-                    # Case C: Lệnh mới rỗng
+                    # Case C: Không có lệnh nào — Mở mới
                     else:
                         if len(state_tracker.bybit_positions) < MAX_BYBIT_POSITIONS:
                             side_str = 'buy' if b_dir == 'LONG' else 'sell'
                             pos_idx = 1 if b_dir == 'LONG' else 2
                             await asyncio.to_thread(exchange.create_market_order, BYBIT_SYMBOL, side_str, target_qty, params={
                                 'positionIdx': pos_idx,
-                                'stopLoss': {'triggerPrice': str(sl), 'type': 'market'},
-                                'takeProfit': {'triggerPrice': str(tp), 'type': 'market'}
+                                'stopLoss': {'triggerPrice': str(round(sl, 2)), 'type': 'market'},
+                                'takeProfit': {'triggerPrice': str(round(tp, 2)), 'type': 'market'}
                             })
                             logger.info(f"✅ Bybit Entry (Mới): {b_dir} @ {current_price:.2f} | Qty: {target_qty:.4f}")
 
